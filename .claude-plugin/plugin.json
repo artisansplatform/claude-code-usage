@@ -1,0 +1,5 @@
+{
+  "name": "usage-report",
+  "version": "0.1.0",
+  "description": "Your personal Claude Code growth report: /usage-report (monthly - wins, prompt-craft trends, next-month suggestions; you review before sharing) and /usage-pulse (weekly, private). Local data only; nothing is uploaded."
+}

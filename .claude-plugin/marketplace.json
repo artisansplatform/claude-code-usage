@@ -1,0 +1,13 @@
+{
+  "name": "artisans-tools",
+  "owner": {
+    "name": "Artisans"
+  },
+  "plugins": [
+    {
+      "name": "usage-report",
+      "source": "./",
+      "description": "Personal Claude Code growth reports: monthly wins-and-trends report plus a private weekly pulse. Generated locally; you review everything before sharing."
+    }
+  ]
+}
