@@ -44,7 +44,7 @@ As we all use AI tools more, we look out for each other: one pasted credential o
 
 1. In any Claude Code session, run:
    ```
-   /plugin marketplace add <org>/claude-usage-report
+   /plugin marketplace add artisansplatform/claude-code-usage
    /plugin install usage-report@artisans-tools
    ```
 2. In `~/.claude/settings.json`, add `"cleanupPeriodDays": 60` (keeps a full month of history so your report is complete).
@@ -66,7 +66,7 @@ That's it. Optionally run `/usage-pulse` any week for a private 1-minute pulse (
   ```json
   {
     "extraKnownMarketplaces": {
-      "artisans-tools": { "source": { "source": "github", "repo": "<org>/claude-usage-report" } }
+      "artisans-tools": { "source": { "source": "github", "repo": "artisansplatform/claude-code-usage" } }
     },
     "enabledPlugins": { "usage-report@artisans-tools": true }
   }
