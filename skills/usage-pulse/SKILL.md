@@ -8,7 +8,7 @@ description: Quick weekly Claude Code usage pulse (deterministic numbers only, n
 A 1-minute self-check. Deterministic only; no prompt scoring, no classification, no content.
 
 1. Window = the last 7 full days ending yesterday (local time). If the user passed a date range, use that instead.
-2. Run `ccur-collect --from <start> --to <end> --out <scratchpad>/ccur-pulse` (fallback `${CLAUDE_PLUGIN_ROOT}/bin/ccur-collect`). Read only `metrics.json`.
+2. Run `${CLAUDE_PLUGIN_ROOT}/bin/ccur-collect --from <start> --to <end> --out <scratchpad>/ccur-pulse` (the collector is not on PATH). Read only `metrics.json`.
 3. Print a pulse of at most 15 lines:
 
 ```

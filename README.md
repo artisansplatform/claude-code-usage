@@ -59,8 +59,8 @@ As we all use AI tools more, we look out for each other: one pasted credential o
 
 ### Every month, first week (~10 minutes)
 
-1. Run `/insights` (takes a few minutes; enriches your report).
-2. Run `/usage-report`.
+1. Run `/insights` (a few minutes; enriches your report).
+2. Run `/usage-report`. It asks ONE question right at the start (the privacy toggle), then runs on its own for about 8-10 minutes - you can walk away after answering. Use your normal default model (Opus or Sonnet class; skip Haiku for this one, the scoring quality matters). A full run costs roughly one medium coding session of quota (~35k output tokens), so any day you can code, you can run it.
 3. Open `~/.claude/usage-reports/report-<month>.md` and read it - it's yours. Check the Examples section before sharing.
 4. Send `report-<month>.md` and `report-<month>.json` to HR.
 

@@ -11,12 +11,14 @@ You produce the user's personal growth report from their LOCAL Claude Code data.
 
 **Month selection**: if the user passed an argument like `2026-08`, use that calendar month. Otherwise: today is day 1-7 of a month -> report the previous full month; else report the current month to date and label the report "(partial month)".
 
-## Step 1 - Collect
+## Step 1 - Ask the one question, then collect
 
-Run the bundled collector (it is on PATH; fallback `${CLAUDE_PLUGIN_ROOT}/bin/ccur-collect`):
+FIRST, ask the data-retention question from Step 6c (one AskUserQuestion call). It is the run's only interaction; asking it up front means everything after runs unattended instead of blocking mid-run while the user is away.
+
+Then run the bundled collector at `${CLAUDE_PLUGIN_ROOT}/bin/ccur-collect` (do not assume it is on PATH):
 
 ```
-ccur-collect --from <YYYY-MM-01> --to <last-day> --out <scratchpad>/ccur
+${CLAUDE_PLUGIN_ROOT}/bin/ccur-collect --from <YYYY-MM-01> --to <last-day> --out <scratchpad>/ccur
 ```
 
 Read `metrics.json` fully. Read `sessions.jsonl` and `prompt_sample.jsonl` only as instructed below. NEVER read raw transcripts under `~/.claude/projects/` yourself; the collector already parsed them, and reading them would blow up cost.
@@ -101,7 +103,7 @@ When N items need tidying, the TL;DR gets one line: "Safety checklist: N small t
 
 ## Step 6c - Data-retention attestation
 
-The consumer "Help improve Claude" toggle is an account-side setting, not readable from the machine. Ask the member directly (one question, options Yes / No / Unsure): "Is 'Help improve Claude' turned OFF at claude.ai Settings -> Privacy?" Record the answer verbatim with today's date in the report and snapshot as `data_retention_attestation`. If No or Unsure, add a next-month opportunity line with the exact settings path so it takes one minute to fix. Do not present the attestation as verified fact; label it "self-reported".
+Asked at the START of the run (see Step 1); this section is where the answer lands in the report. The consumer "Help improve Claude" toggle is an account-side setting, not readable from the machine. The question (options Yes / No / Unsure): "Is 'Help improve Claude' turned OFF at claude.ai Settings -> Privacy?" Record the answer verbatim with today's date in the report and snapshot as `data_retention_attestation`. If No or Unsure, add a next-month opportunity line with the exact settings path so it takes one minute to fix. Do not present the attestation as verified fact; label it "self-reported".
 
 ## Step 7 - Trends
 
