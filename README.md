@@ -50,7 +50,11 @@ As we all use AI tools more, we look out for each other: one pasted credential o
    ```
    /plugin install usage-report@artisans-tools
    ```
-3. In `~/.claude/settings.json`, add `"cleanupPeriodDays": 60` (keeps a full month of history so your report is complete).
+   When the dialog asks for a scope, pick **"Install for you (user scope)"** so the commands work in all your repos, not just the current one.
+3. Run this in your terminal (keeps six months of session history so your reports and trends stay complete; it only raises the value, never lowers it):
+   ```
+   python3 -c "import json,pathlib;p=pathlib.Path.home()/'.claude/settings.json';d=json.loads(p.read_text() or '{}') if p.exists() else {};d['cleanupPeriodDays']=max(180,int(d.get('cleanupPeriodDays') or 0));p.parent.mkdir(parents=True,exist_ok=True);p.write_text(json.dumps(d,indent=2));print('cleanupPeriodDays =',d['cleanupPeriodDays'])"
+   ```
 4. At claude.ai -> Settings -> Privacy, turn OFF "Help improve Claude".
 
 ### Every month, first week (~10 minutes)
