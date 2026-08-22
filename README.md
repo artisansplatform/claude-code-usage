@@ -42,13 +42,16 @@ As we all use AI tools more, we look out for each other: one pasted credential o
 
 ### One-time setup (5 minutes)
 
-1. In any Claude Code session, run:
+1. In any Claude Code session, add the marketplace:
    ```
    /plugin marketplace add artisansplatform/claude-code-usage
+   ```
+2. Install the plugin:
+   ```
    /plugin install usage-report@artisans-tools
    ```
-2. In `~/.claude/settings.json`, add `"cleanupPeriodDays": 60` (keeps a full month of history so your report is complete).
-3. At claude.ai -> Settings -> Privacy, turn OFF "Help improve Claude".
+3. In `~/.claude/settings.json`, add `"cleanupPeriodDays": 60` (keeps a full month of history so your report is complete).
+4. At claude.ai -> Settings -> Privacy, turn OFF "Help improve Claude".
 
 ### Every month, first week (~10 minutes)
 
@@ -83,3 +86,7 @@ This plugin covers what those cannot: prompt quality, categories, friction/learn
 ## Maintenance
 
 The collector (`bin/ccur-collect`) parses `~/.claude` files that Anthropic documents as internal and version-unstable. It skips anything it does not recognize, so it degrades rather than breaks; still, expect small updates after major Claude Code releases. Bump `collector_version` when definitions change, and note it in reports (trend breaks must be visible).
+
+## License
+
+MIT - see [LICENSE](LICENSE).
