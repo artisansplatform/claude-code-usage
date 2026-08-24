@@ -357,6 +357,78 @@ def _mcp_entry(cfg):
     return f"stdio:{cmd}"
 
 
+
+# Allow-rules that let the assistant do something irreversible or production-
+# affecting without a prompt. Each entry: (regex over the rule text, reason).
+# Rules are config strings, not secrets, so the report may list them verbatim.
+DANGEROUS_ALLOW_PATTERNS = [
+    (r"^Bash$|^Bash\(\*\)$|^Bash\(:\*\)$|^Bash\(\*:\*\)$", "blanket shell access"),
+    (r"rm -r|rm -f|rm \*|shred|mkfs|\bdd\b", "destructive file deletion"),
+    (r"git push|gh pr merge|gh release|git reset --hard|git clean|git branch -D|git tag -d",
+     "irreversible or remote-affecting git action"),
+    (r"deploy|kubectl|helm|terraform|ansible|\baws\b|gcloud|\baz\b|\bssh\b|\bscp\b|rsync",
+     "deploy / infrastructure / remote host"),
+    (r"docker (compose )?(down|rm|rmi|system prune|volume rm)", "destroys containers or volumes"),
+    (r"psql|mysql|mongosh?|redis-cli|(upgrade|downgrade) head|DROP |TRUNCATE |DELETE ",
+     "direct database mutation"),
+    (r"npm publish|twine|cargo publish|gem push", "publishes a package"),
+    (r"\bsudo\b|chmod 777|systemctl|crontab", "privileged system change"),
+    (r"prod", "mentions production"),
+]
+SAFE_HINTS = (r"(status|log|diff|show|fetch|--dry-run|-n\b|list|describe|\bget\b|\bls\b|"
+              r"is-active|current-context|config (get|view|current)|test_|--version|--help|"
+              r"\bcat\b|\bhead\b|\btail\b|\bgrep\b|\bwc\b)")
+
+
+def _rules_from(path):
+    try:
+        perms = json.loads(Path(path).read_text()).get("permissions") or {}
+    except Exception:
+        return None
+    return {
+        "allow": [r for r in (perms.get("allow") or []) if isinstance(r, str)],
+        "deny": [r for r in (perms.get("deny") or []) if isinstance(r, str)],
+        "default_mode": perms.get("defaultMode"),
+    }
+
+
+def permission_rules_audit(project_paths):
+    layers = {"user": CLAUDE_HOME / "settings.json",
+              "user-local": CLAUDE_HOME / "settings.local.json",
+              "managed": Path("/etc/claude-code/managed-settings.json")}
+    for cwd in project_paths:
+        layers[f"{Path(cwd).name}"] = Path(cwd) / ".claude" / "settings.json"
+        layers[f"{Path(cwd).name}-local"] = Path(cwd) / ".claude" / "settings.local.json"
+    dangerous, deny_all, default_modes = [], [], {}
+    allow_total = 0
+    for name, path in layers.items():
+        rules = _rules_from(path)
+        if not rules:
+            continue
+        allow_total += len(rules["allow"])
+        deny_all += rules["deny"]
+        if rules["default_mode"]:
+            default_modes[name] = rules["default_mode"]
+        for rule in rules["allow"]:
+            read_only = bool(re.search(SAFE_HINTS, rule)) and \
+                not re.search(r"^Bash$|\(\*\)|\(:\*\)", rule)
+            for pat, reason in DANGEROUS_ALLOW_PATTERNS:
+                if re.search(pat, rule, re.IGNORECASE):
+                    # "mentions production" and read-only shaped rules are review
+                    # items, not flags; everything else can cause real damage.
+                    severity = "review" if (read_only or reason == "mentions production") \
+                        else "high"
+                    dangerous.append({"rule": rule, "layer": name,
+                                      "reason": reason, "severity": severity})
+                    break
+    return {
+        "allow_rules_total": allow_total,
+        "deny_rules": sorted(set(deny_all)),
+        "default_modes": default_modes,
+        "dangerous_allow_rules": [d for d in dangerous if d["severity"] == "high"],
+        "review_allow_rules": [d for d in dangerous if d["severity"] == "review"],
+    }
+
 def security_scan(sessions, project_paths):
     modes = Counter((s.get("permission_mode") or "default") for s in sessions)
     mcp = {}
@@ -395,9 +467,20 @@ def security_scan(sessions, project_paths):
             .get("cleanupPeriodDays")
     except Exception:
         pass
+    pretool_hooks = 0
+    for cfg in [CLAUDE_HOME / "settings.json"] + \
+            [Path(c) / ".claude" / "settings.json" for c in project_paths]:
+        try:
+            hooks = json.loads(cfg.read_text()).get("hooks") or {}
+            pretool_hooks += len(hooks.get("PreToolUse") or [])
+        except Exception:
+            continue
     return {
         "permission_modes_by_session": dict(modes),
+        "auto_mode_sessions": modes.get("auto", 0),
         "bypass_permissions_sessions": modes.get("bypassPermissions", 0),
+        "permission_rules": permission_rules_audit(project_paths),
+        "pretooluse_guard_hooks": pretool_hooks,
         "sandbox_disabled_bash_calls": sum(s.get("sandbox_disables", 0) for s in sessions),
         "bash_commands_with_credential_shapes": sum(s.get("bash_cred_hits", 0)
                                                     for s in sessions),

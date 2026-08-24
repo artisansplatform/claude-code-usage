@@ -38,6 +38,30 @@ As we all use AI tools more, we look out for each other: one pasted credential o
 - The "Help improve Claude" (training/retention) toggle lives in the claude.ai account, not on disk, so the report records a dated self-attestation instead of pretending to verify it. Org-managed accounts (Team/Enterprise) make this a non-issue: training is off by default and retention is admin-controlled.
 - Hosting: a private repo requires every member to have read access (org membership or a team) before `/plugin marketplace add` works. Public is acceptable for THIS repo because it contains only generic tooling, but never commit reports, member names, or marketplace settings with internal URLs into a public repo.
 
+## Production safety baseline (recommended for everyone)
+
+Team goal: the assistant must never be able to do something unrecoverable or production-affecting without a human in the loop. Auto mode is fine for day-to-day work as long as this fence is in place. Setup step 4 installs this for you; here is what it adds to `~/.claude/settings.json` (deny always wins over allow, whatever mode you are in):
+
+```json
+{
+  "permissions": {
+    "deny": [
+      "Bash(rm -rf:*)", "Bash(git push --force:*)", "Bash(git push -f:*)",
+      "Bash(git reset --hard:*)", "Bash(git clean:*)", "Bash(sudo:*)",
+      "Bash(terraform apply:*)", "Bash(terraform destroy:*)",
+      "Bash(kubectl apply:*)", "Bash(kubectl delete:*)",
+      "Bash(aws s3 rm:*)", "Bash(aws s3api delete:*)",
+      "Bash(docker system prune:*)", "Bash(docker compose down -v:*)",
+      "Read(./.env)", "Read(./.env.*)", "Read(**/*.pem)"
+    ]
+  }
+}
+```
+
+The monthly report checks this: it lists any allow-rule that could push, delete, deploy, or mutate a database without asking, shows your deny-rules and PreToolUse guard hooks, and reports how many sessions ran in `auto` vs `bypassPermissions` mode.
+
+Honest limit: deny-rules match command prefixes, so a script, a Makefile target, or `bash -c "..."` can still wrap a dangerous command. The durable protection is environmental: no production credentials on dev machines, and production deploys only through CI with a human approval step. For org-wide enforcement that members cannot override, the same `permissions.deny` block goes in managed settings (`/etc/claude-code/managed-settings.json` on Linux).
+
 ## Steps
 
 ### One-time setup (5 minutes)
@@ -55,7 +79,11 @@ As we all use AI tools more, we look out for each other: one pasted credential o
    ```
    python3 -c "import json,pathlib;p=pathlib.Path.home()/'.claude/settings.json';d=json.loads(p.read_text() or '{}') if p.exists() else {};d['cleanupPeriodDays']=max(180,int(d.get('cleanupPeriodDays') or 0));p.parent.mkdir(parents=True,exist_ok=True);p.write_text(json.dumps(d,indent=2));print('cleanupPeriodDays =',d['cleanupPeriodDays'])"
    ```
-4. At claude.ai -> Settings -> Privacy, turn OFF "Help improve Claude".
+4. Install the production-safety baseline (adds the deny-rules listed above; keeps everything else in your settings as is; safe to re-run):
+   ```
+   python3 -c "import json,pathlib;p=pathlib.Path.home()/\".claude/settings.json\";d=json.loads(p.read_text() or \"{}\") if p.exists() else {};perm=d.setdefault(\"permissions\",{});deny=perm.setdefault(\"deny\",[]);base=[\"Bash(rm -rf:*)\",\"Bash(git push --force:*)\",\"Bash(git push -f:*)\",\"Bash(git reset --hard:*)\",\"Bash(git clean:*)\",\"Bash(sudo:*)\",\"Bash(terraform apply:*)\",\"Bash(terraform destroy:*)\",\"Bash(kubectl apply:*)\",\"Bash(kubectl delete:*)\",\"Bash(aws s3 rm:*)\",\"Bash(aws s3api delete:*)\",\"Bash(docker system prune:*)\",\"Bash(docker compose down -v:*)\",\"Read(./.env)\",\"Read(./.env.*)\",\"Read(**/*.pem)\"];added=[r for r in base if r not in deny];deny.extend(added);p.parent.mkdir(parents=True,exist_ok=True);p.write_text(json.dumps(d,indent=2));print(\"deny rules added:\",len(added),\"| total deny:\",len(deny))"
+   ```
+5. At claude.ai -> Settings -> Privacy, turn OFF "Help improve Claude".
 
 ### Every month, first week (~10 minutes)
 

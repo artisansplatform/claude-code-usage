@@ -89,7 +89,11 @@ From `metrics.json.security`, build a "Safety checklist" section. Frame it as th
 
 | Check | Value | Worth tidying when |
 |---|---|---|
-| Permission modes used | session counts per mode | any `bypassPermissions` session |
+| Permission modes used | session counts per mode (`auto` = classifier auto-approves routine actions) | any `bypassPermissions` session; note `auto` share as information, it is fine when the rows below are clean |
+| Default permission mode in settings | `permission_rules.default_modes` | `bypassPermissions` anywhere |
+| Allow-rules that could hurt production | `permission_rules.dangerous_allow_rules` (rule + layer + reason) | any - these let the assistant push, delete, deploy, or mutate a database without asking |
+| Allow-rules worth a glance | `permission_rules.review_allow_rules` | list count only; read-only infra commands and anything mentioning prod - no flag, just a look |
+| Deny-rules and guard hooks | `permission_rules.deny_rules` + `pretooluse_guard_hooks` | none present - point to the baseline deny-list in the README; when present, celebrate it: this is the fence that keeps AI away from anything unrecoverable |
 | Sandbox-disabled Bash calls | count | > 0 |
 | Credential-shaped strings in prompts | `hygiene` count | > 0 |
 | Credential-shaped strings in Bash commands | count | > 0 |
@@ -99,7 +103,7 @@ From `metrics.json.security`, build a "Safety checklist" section. Frame it as th
 | Claude Code versions in window | newest + count | a single version across a full month (auto-update likely off, so security fixes are not arriving) |
 | cleanupPeriodDays | value | unset or < 45 |
 
-When N items need tidying, the TL;DR gets one line: "Safety checklist: N small things to tidy (details inside)". When zero, say "Safety checklist: all clear" - a clean checklist deserves the mention. Every item pairs with its one-line fix. These are conversation-starters, not verdicts: an unlisted MCP server is usually perfectly legitimate.
+When N items need tidying, the TL;DR gets one line: "Safety checklist: N small things to tidy (details inside)". The team goal behind this table, state it once in the section intro: the assistant should never be able to do something unrecoverable or production-affecting without a human in the loop. When zero, say "Safety checklist: all clear" - a clean checklist deserves the mention. Every item pairs with its one-line fix. These are conversation-starters, not verdicts: an unlisted MCP server is usually perfectly legitimate.
 
 ## Step 6c - Data-retention attestation
 
