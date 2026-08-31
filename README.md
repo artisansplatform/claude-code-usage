@@ -96,7 +96,7 @@ That's it. Optionally run `/usage-pulse` any week for a private 1-minute pulse (
 
 ### For HR / admin
 
-- Put everyone's `.json` for the month in one folder and run `python3 manager/aggregate.py <folder>` for the team snapshot. Use it per the ground rules above: spot shared training needs, celebrate wins.
+- Put everyone's zip for the month in one folder and run `python3 manager/aggregate.py <folder>` for the team snapshot - it reads the `.json` out of each zip, and still accepts loose `.json` files. Use it per the ground rules above: spot shared training needs, celebrate wins.
 - Optional: auto-prompt installation for everyone by adding to a shared repo's checked-in `.claude/settings.json`:
   ```json
   {

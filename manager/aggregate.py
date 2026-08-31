@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Combine everyone's shared report-YYYY-MM.json files into one team snapshot.
 
-Usage: python3 aggregate.py <dir-with-report-json-files> [--out team-summary.md]
-The .md reports are for reading; this consumes only the shared-safe .json.
+Usage: python3 aggregate.py <dir-with-report-zips-or-json> [--out team-summary.md]
+Members send a zip of their .md + .json, so the folder is read either way: a
+loose .json, or the .json inside each zip. The .md reports are for reading;
+this consumes only the shared-safe .json.
 Per the README ground rules: this table is for spotting shared training needs
 and celebrating wins, not for ranking people.
 """
@@ -10,6 +12,7 @@ and celebrating wins, not for ranking people.
 import argparse
 import json
 import sys
+import zipfile
 from pathlib import Path
 
 
@@ -43,6 +46,25 @@ COLUMNS = [
 ]
 
 
+def report_blobs(reports_dir):
+    """(label, json text) per report, from a loose .json or from inside a .zip."""
+    d = Path(reports_dir)
+    if not d.is_dir():
+        sys.exit(f"not a folder: {reports_dir}")
+    for f in sorted(d.iterdir()):
+        suffix = f.suffix.lower()
+        try:
+            if suffix == ".json":
+                yield f.name, f.read_text()
+            elif suffix == ".zip":
+                with zipfile.ZipFile(f) as z:
+                    for name in sorted(z.namelist()):
+                        if name.lower().endswith(".json"):
+                            yield f"{f.name}:{name}", z.read(name).decode()
+        except Exception as e:
+            print(f"skip {f.name}: {e}", file=sys.stderr)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("reports_dir")
@@ -50,13 +72,13 @@ def main():
     args = ap.parse_args()
 
     rows = []
-    for f in sorted(Path(args.reports_dir).glob("*.json")):
+    for label, text in report_blobs(args.reports_dir):
         try:
-            rows.append(flat(json.loads(f.read_text())))
+            rows.append(flat(json.loads(text)))
         except Exception as e:
-            print(f"skip {f.name}: {e}", file=sys.stderr)
+            print(f"skip {label}: {e}", file=sys.stderr)
     if not rows:
-        sys.exit("no readable report .json files found")
+        sys.exit("no readable report .json found (loose or inside a .zip)")
 
     keys = [k for k, _ in COLUMNS]
     heads = [h for _, h in COLUMNS]
