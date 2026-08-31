@@ -129,8 +129,9 @@ Head the section with: "Examples (redacted; review before sharing)".
    TL;DR (3 wins, 3 next-month opportunities each with its payoff, one encouraging summary line) -> Headline block -> Category mix -> Prompt Quality -> Working style -> Learning signals -> Safety checklist -> Trends -> Examples -> Definitions appendix (copy from metrics.json + score rubric version).
 2. `~/.claude/usage-reports/report-<YYYY-MM>.json` - shared-safe numbers only (member, window, headline numbers, category mix, prompt score + dims, interruptions/100, plan/delegation %, outcomes, foundation counts, security block {flags_total, per-check values, attestation}, deltas). No prompt text, no summaries, no project paths (project basenames are fine).
 3. `~/.claude/usage-reports/snapshots/<YYYY-MM>.json` - same as (2); it feeds next month's trend section.
+4. `~/.claude/usage-reports/<Member>-<Month>-<Year>.zip` - zip containing just the two files from (1) and (2) (`report-<YYYY-MM>.md` and `report-<YYYY-MM>.json`, no directory nesting). `<Member>` is `metrics.json.member` with each run of whitespace replaced by a dash (it comes from `git config user.name`, so expect `First Last`, and `unknown` when unset); `<Month>` is the full month name (e.g. `August`); `<Year>` is the 4-digit year for the reported month, joined with dashes - e.g. `Mark-Taylor-August-2026.zip`. Build it with `python3 -m zipfile -c <zip> <md> <json>`, quoting the paths - stdlib, so it works wherever the collector does, whereas `zip` is not on every machine.
 
-Finish by printing: the TL;DR, both file paths, and this exact instruction: "This report is yours - review the Examples section, then send report-<YYYY-MM>.md and .json to HR."
+Finish by printing: the TL;DR, all three file paths (md, json, zip), and this exact instruction: "This report is yours - review the Examples section, then send <Member>-<Month>-<Year>.zip to HR."
 
 ## Hard privacy rules
 

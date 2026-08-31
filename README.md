@@ -90,13 +90,13 @@ Honest limit: deny-rules match command prefixes, so a script, a Makefile target,
 1. Run `/insights` (a few minutes; enriches your report).
 2. Run `/usage-report`. It asks ONE question right at the start (the privacy toggle), then runs on its own for about 8-10 minutes - you can walk away after answering. Use your normal default model (Opus or Sonnet class; skip Haiku for this one, the scoring quality matters). A full run costs roughly one medium coding session of quota (~35k output tokens), so any day you can code, you can run it.
 3. Open `~/.claude/usage-reports/report-<month>.md` and read it - it's yours. Check the Examples section before sharing.
-4. Send `report-<month>.md` and `report-<month>.json` to HR.
+4. Send `<Member>-<Month>-<Year>.zip` to HR - a zip of just your `report-<month>.md` and `report-<month>.json`, written next to them in `~/.claude/usage-reports/`.
 
 That's it. Optionally run `/usage-pulse` any week for a private 1-minute pulse (never shared; also feeds your "vs last week" line).
 
 ### For HR / admin
 
-- Put everyone's `.json` for the month in one folder and run `python3 manager/aggregate.py <folder>` for the team snapshot. Use it per the ground rules above: spot shared training needs, celebrate wins.
+- Put everyone's zip for the month in one folder and run `python3 manager/aggregate.py <folder>` for the team snapshot - it reads the `.json` out of each zip, and still accepts loose `.json` files. Use it per the ground rules above: spot shared training needs, celebrate wins.
 - Optional: auto-prompt installation for everyone by adding to a shared repo's checked-in `.claude/settings.json`:
   ```json
   {
