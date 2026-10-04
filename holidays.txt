@@ -1,0 +1,13 @@
+# Office holidays, one YYYY-MM-DD per line. Blank lines and '#' comments are fine.
+# Maintained by HR / the plugin owner; members get updates with the plugin
+# (`claude plugin update usage-report@artisans-tools`), so do not edit your local copy.
+# A Mon-Fri date listed here is excluded from workdays, so it never counts as an
+# inactive day; working on it counts with weekend days. Weekend dates are harmless.
+2026-09-03
+2026-09-04
+2026-10-02  # Gandhi Jayanti
+2026-10-21  # Vijayadashami / Dussehra
+2026-11-08  # Diwali
+2026-11-09  # Diwali
+2026-11-10  # Diwali
+2026-12-25  # Christmas

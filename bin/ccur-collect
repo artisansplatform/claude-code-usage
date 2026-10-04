@@ -8,29 +8,60 @@ here is defensive: unknown record types and malformed lines are skipped.
 
 Outputs (in --out dir):
   metrics.json         aggregate numbers only (safe to build a shared report from)
+  shared.json          the fixed-schema shared document (schema 2.0): every
+                       deterministic field filled, the `llm` fields left null
   sessions.jsonl       compact per-session rows, LOCAL ONLY (contains prompt/summary text)
   prompt_sample.jsonl  stratified sample of prompts for quality scoring, LOCAL ONLY
 """
 
 import argparse
 import json
+import math
 import os
 import re
 import statistics
 import subprocess
 import sys
 from collections import Counter, defaultdict
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 
+COLLECTOR_VERSION = "0.2.0"
+SHARED_SCHEMA_VERSION = "2.0"
 CLAUDE_HOME = Path(os.environ.get("CLAUDE_CONFIG_DIR", str(Path.home() / ".claude")))
+PLUGIN_ROOT = Path(__file__).resolve().parents[1]
+HOLIDAYS_FILE = PLUGIN_ROOT / "holidays.txt"       # maintained by HR / the plugin owner
+MEMBER_FILE = Path.home() / ".claude" / "usage-reports" / "member.txt"
 IDLE_GAP_MIN = 30          # gaps longer than this don't count as active time
 FIRST_PROMPT_CHARS = 240
 SAMPLE_PROMPT_CHARS = 600
+# User records Claude Code writes itself: slash-command echoes, background-task
+# completions, `!` shell output. Not typed prompts, so they neither count nor
+# get scored (history.jsonl never holds them either).
 META_MARKERS = ("<command-name>", "<local-command-stdout>", "[Request interrupted",
-                "<system-reminder>", "Caveat: The messages below")
+                "<system-reminder>", "Caveat: The messages below", "<task-notification>",
+                "<bash-input>", "<bash-stdout>", "<bash-stderr>")
 DELEGATION_TOOLS = {"Task", "Agent", "Workflow"}
 PLAN_TOOLS = {"ExitPlanMode", "EnterPlanMode", "exit_plan_mode"}
+
+# Context hygiene thresholds; definitions in metrics.json quote these.
+SHORT_PROMPT_CHARS = 40            # typed text shorter than this: a short follow-up
+BRIEF_PROMPT_CHARS = 200           # typed text this long: a task brief
+LONG_CONTEXT_TOKENS = 200_000      # conversation size that makes a prompt "long-context"
+COLD_RESUME_GAP_MIN = 60           # prompt cache TTL on subscriptions is 1 hour
+COLD_RESUME_MIN_CONTEXT = 100_000  # smaller conversations are cheap to re-cache
+# Token price relative to the same model's base input price (cost_mix_pct only).
+COST_WEIGHTS = {"cache_read": 0.1, "cache_creation": 2.0, "input": 1.0, "output": 5.0}
+TOKEN_KEYS = ("input", "output", "cache_read", "cache_creation")
+
+HISTORY_MIN_COVERAGE_PCT = 80      # below this the rhythm comes from transcripts
+SLASH_MATCH_SECONDS = 60           # history vs transcript record of one slash command
+SLASH_IN_TRANSCRIPT = re.compile(r"<command-name>(/[\w:-]+)</command-name>")
+SLASH_NAME = re.compile(r"^/[\w:-]+$")   # "/home/me/x.log what is this" is not a command
+
+APPROVED_MARKETPLACES = ("claude-plugins-official", "artisans-tools")
+SINGLE_VERSION_MIN_WORKDAYS = 20
+CLEANUP_MIN_DAYS = 45
 
 # Best-effort masking of credential-shaped strings before prompt text is stored
 # for LLM scoring. Defense in depth: the files stay local either way.
@@ -73,6 +104,11 @@ def local(dt):
     return dt.astimezone() if dt else None
 
 
+def local_midnight(d):
+    """Start of local day d (the offset of that date, so DST shifts are honoured)."""
+    return datetime.combine(d, time()).astimezone()
+
+
 def read_jsonl(path):
     try:
         with open(path, encoding="utf-8", errors="replace") as fh:
@@ -81,11 +117,22 @@ def read_jsonl(path):
                 if not line:
                     continue
                 try:
-                    yield json.loads(line)
+                    rec = json.loads(line)
                 except Exception:
                     continue
+                if isinstance(rec, dict):
+                    yield rec
     except OSError:
         return
+
+
+def read_json(path):
+    """Parsed JSON object, or None. UTF-8 explicitly: Windows defaults to cp1252."""
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8", errors="replace"))
+    except Exception:
+        return None
+    return data if isinstance(data, dict) else None
 
 
 def text_of_user_message(msg):
@@ -96,7 +143,7 @@ def text_of_user_message(msg):
     if isinstance(content, list):
         parts = [b.get("text", "") for b in content
                  if isinstance(b, dict) and b.get("type") == "text"]
-        return "\n".join(p for p in parts if p)
+        return "\n".join(p for p in parts if isinstance(p, str) and p)
     return ""
 
 
@@ -104,10 +151,36 @@ def is_meta_text(txt):
     return any(m in txt for m in META_MARKERS)
 
 
+def tok(v):
+    """A usage counter as int; None, strings, bools and the like count as 0."""
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return 0
+    return int(v)
+
+
+def pct(part, whole, nd=1):
+    return round(100 * part / whole, nd) if whole else None
+
+
+def nearest_rank(sorted_vals, q):
+    """q-quantile by nearest rank (deterministic, fine for small n)."""
+    if not sorted_vals:
+        return None
+    return sorted_vals[max(0, math.ceil(q * len(sorted_vals)) - 1)]
+
+
+def human_tokens(n):
+    for div, unit in ((1e9, "B"), (1e6, "M"), (1e3, "k")):
+        if abs(n) >= div:
+            return f"{n / div:.1f}{unit}"
+    return str(n)
+
+
 # ---------------------------------------------------------------- history.jsonl
 
 def collect_history(frm, to):
-    """Prompt rhythm from history.jsonl (covers all projects, survives cleanup)."""
+    """Prompt rhythm from history.jsonl (covers all projects, survives cleanup).
+    `to` is exclusive (local midnight after the window's last day)."""
     rows = []
     for rec in read_jsonl(CLAUDE_HOME / "history.jsonl"):
         ts = rec.get("timestamp")
@@ -116,12 +189,13 @@ def collect_history(frm, to):
         except Exception:
             continue
         ldt = local(dt)
-        if not (frm <= ldt <= to):
+        if not (frm <= ldt < to):
             continue
+        project, text = rec.get("project"), rec.get("display")
         rows.append({
             "dt": ldt,
-            "project": rec.get("project") or "?",
-            "text": (rec.get("display") or "").strip(),
+            "project": project if isinstance(project, str) and project else "?",
+            "text": text.strip() if isinstance(text, str) else "",
             "session": rec.get("sessionId") or "",
         })
     return rows
@@ -129,52 +203,120 @@ def collect_history(frm, to):
 
 # ---------------------------------------------------------------- transcripts
 
+def take_call(calls, rec, msg, ldt, inwin):
+    """File one assistant record under its API call (message id). The first record
+    of a call fixes its time and position; the last usage snapshot wins.
+    Returns the message id when this record opened a new call."""
+    model = msg.get("model")
+    usage = msg.get("usage")
+    if not model or model == "<synthetic>" or not isinstance(usage, dict):
+        return None
+    mid = msg.get("id") or rec.get("requestId") or rec.get("uuid")
+    if not mid:
+        return None
+    call = calls.get(mid)
+    is_new = call is None
+    if is_new:
+        call = calls[mid] = {"ts": ldt, "inwin": inwin}
+    elif call["ts"] is None and ldt:
+        call["ts"], call["inwin"] = ldt, inwin
+    call["model"] = model
+    call["input"] = tok(usage.get("input_tokens"))
+    call["output"] = tok(usage.get("output_tokens"))
+    call["cache_read"] = tok(usage.get("cache_read_input_tokens"))
+    call["cache_creation"] = tok(usage.get("cache_creation_input_tokens"))
+    # everything Claude re-sent for this step = the conversation size at that point
+    call["context"] = call["input"] + call["cache_read"] + call["cache_creation"]
+    return mid if is_new else None
+
+
+def keep_unseen(calls, seen_msgs):
+    """Drop calls an earlier file already counted; remember the rest."""
+    kept = {}
+    for mid, call in calls.items():
+        if mid not in seen_msgs:
+            seen_msgs.add(mid)
+            kept[mid] = call
+    return kept
+
+
+def is_cold_resume(p):
+    return (p["gap_min"] is not None and p["gap_min"] >= COLD_RESUME_GAP_MIN
+            and p["first_context"] is not None
+            and p["first_context"] >= COLD_RESUME_MIN_CONTEXT)
+
+
+def is_long_context(p):
+    return p["first_context"] is not None and p["first_context"] >= LONG_CONTEXT_TOKENS
+
+
 def parse_session(path, frm, to, seen_msgs, seen_prompts):
-    """seen_msgs / seen_prompts dedupe across files: a resumed session copies
-    prior records into a new .jsonl, so per-file counting double-counts."""
+    """One main-thread transcript; `to` is exclusive. seen_msgs / seen_prompts
+    dedupe across files: a resumed or forked session can copy prior records into
+    a new .jsonl, so per-file counting double-counts. Prompts, API calls, tool
+    calls, errors, interruptions and active time count only for records whose own
+    timestamp is inside the window; the row exists when the session overlaps it."""
     first_ts = last_ts = None
-    ts_points = []
+    win_ts = []                # in-window timestamps: active time, days spanned
     prompts = 0
     first_prompt = None
+    typed = []                 # in-window typed prompts (rhythm fallback, sample)
+    slash = []                 # in-window <command-name> records
+    events = []                # ("p", prompt) / ("c", message id) in file order
+    calls, side_calls = {}, {}
     models = Counter()
     tools = Counter()
     tool_errors = 0
     interruptions = 0
     sidechain_records = 0
-    usage_by_msg = {}
     cwd = None
     git_branch = None
-    version = None
+    versions = set()
     permission_mode = None
     sandbox_disables = 0
     bash_cred_hits = 0
+    last_api_ts = None         # previous main-thread API call (cache refresh)
 
     for rec in read_jsonl(path):
         rtype = rec.get("type")
-        ts = parse_iso(rec.get("timestamp", "")) if rec.get("timestamp") else None
-        if ts:
-            ldt = local(ts)
-            ts_points.append(ldt)
+        ldt = local(parse_iso(rec["timestamp"])) if rec.get("timestamp") else None
+        inwin = ldt is not None and frm <= ldt < to
+        if ldt:
             first_ts = min(first_ts, ldt) if first_ts else ldt
             last_ts = max(last_ts, ldt) if last_ts else ldt
+            if inwin:
+                win_ts.append(ldt)
+        msg = rec.get("message")
+        if not isinstance(msg, dict):
+            msg = {}
         if rec.get("isSidechain"):
-            sidechain_records += 1
+            # older layout: subagent turns inline in the parent file. Never typed
+            # prompts, but their API calls are subagent usage.
+            if inwin:
+                sidechain_records += 1
+            if rtype == "assistant":
+                take_call(side_calls, rec, msg, ldt, inwin)
             continue
-        cwd = rec.get("cwd") or cwd
+        if isinstance(rec.get("cwd"), str) and rec["cwd"]:
+            cwd = rec["cwd"]
         git_branch = rec.get("gitBranch") or git_branch
-        version = rec.get("version") or version
+        if inwin and isinstance(rec.get("version"), str):
+            versions.add(rec["version"])
         if rtype == "permission-mode":
             permission_mode = rec.get("permissionMode") or permission_mode
-        msg = rec.get("message") or {}
 
         if rtype == "assistant":
             model = msg.get("model")
             if model and model != "<synthetic>":
-                models[model] += 1
-                mid = msg.get("id") or rec.get("requestId") or rec.get("uuid")
-                usage = msg.get("usage")
-                if mid and isinstance(usage, dict):
-                    usage_by_msg[mid] = (model, usage)  # last snapshot per message wins
+                if inwin:
+                    models[model] += 1
+                mid = take_call(calls, rec, msg, ldt, inwin)
+                if mid:
+                    events.append(("c", mid))
+                if ldt:
+                    last_api_ts = max(last_api_ts, ldt) if last_api_ts else ldt
+            if not inwin:
+                continue
             for block in msg.get("content") or []:
                 if isinstance(block, dict) and block.get("type") == "tool_use":
                     name = block.get("name") or "?"
@@ -189,7 +331,7 @@ def parse_session(path, frm, to, seen_msgs, seen_prompts):
                             bash_cred_hits += 1
         elif rtype == "user":
             content = msg.get("content")
-            if isinstance(content, list):
+            if inwin and isinstance(content, list):
                 for block in content:
                     if isinstance(block, dict) and block.get("type") == "tool_result" \
                             and block.get("is_error"):
@@ -198,49 +340,78 @@ def parse_session(path, frm, to, seen_msgs, seen_prompts):
             if not txt:
                 continue
             if "[Request interrupted" in txt:
-                interruptions += 1
+                if inwin:
+                    interruptions += 1
                 continue
             if rec.get("isMeta") or is_meta_text(txt):
+                m = SLASH_IN_TRANSCRIPT.search(txt)
+                if m and inwin:
+                    slash.append({"dt": ldt, "cmd": m.group(1), "uuid": rec.get("uuid")})
                 continue
             ruid = rec.get("uuid")
             if ruid and ruid in seen_prompts:
                 continue
             if ruid:
                 seen_prompts.add(ruid)
-            prompts += 1
             if first_prompt is None:
                 first_prompt = redact(txt[:FIRST_PROMPT_CHARS])[0]
+            if not inwin:
+                continue
+            prompts += 1
+            prompt = {"dt": ldt, "text": txt, "project": cwd or "?",
+                      "gap_min": (ldt - last_api_ts).total_seconds() / 60
+                      if last_api_ts else None}
+            typed.append(prompt)
+            events.append(("p", prompt))
 
-    if not first_ts or last_ts < frm or first_ts > to:
+    kept = keep_unseen(calls, seen_msgs)
+    side = [c for c in keep_unseen(side_calls, seen_msgs).values() if c["inwin"]]
+    if not first_ts or last_ts < frm or first_ts >= to:
         return None
 
-    ts_points.sort()
+    # Per-prompt accounting: each in-window API call belongs to the latest typed
+    # prompt before it in the same session (calls before the first one: nobody's).
+    main_calls, pstats, cur = [], [], None
+    for kind, item in events:
+        if kind == "p":
+            cur = {"chars": len(item["text"]), "gap_min": item["gap_min"], "calls": 0,
+                   "first_context": None, "first_cache_creation": 0,
+                   "output": 0, "context": 0}
+            pstats.append(cur)
+            continue
+        call = kept.get(item)
+        if call is None or not call["inwin"]:
+            continue
+        main_calls.append(call)
+        if cur is None:
+            continue
+        if cur["first_context"] is None:
+            cur["first_context"] = call["context"]
+            cur["first_cache_creation"] = call["cache_creation"]
+        cur["calls"] += 1
+        cur["output"] += call["output"]
+        cur["context"] += call["context"]
+
+    win_ts.sort()
     active_min = 0.0
-    for a, b in zip(ts_points, ts_points[1:]):
+    for a, b in zip(win_ts, win_ts[1:]):
         gap = (b - a).total_seconds() / 60
         if 0 <= gap <= IDLE_GAP_MIN:
             active_min += gap
 
-    tokens_by_model = defaultdict(lambda: {"input": 0, "output": 0,
-                                           "cache_read": 0, "cache_creation": 0})
-    for mid in list(usage_by_msg):
-        if mid in seen_msgs:
-            del usage_by_msg[mid]
-        else:
-            seen_msgs.add(mid)
-    for model, usage in usage_by_msg.values():
-        t = tokens_by_model[model]
-        t["input"] += usage.get("input_tokens") or 0
-        t["output"] += usage.get("output_tokens") or 0
-        t["cache_read"] += usage.get("cache_read_input_tokens") or 0
-        t["cache_creation"] += usage.get("cache_creation_input_tokens") or 0
+    tokens_by_model = defaultdict(lambda: dict.fromkeys(TOKEN_KEYS, 0))
+    for call in main_calls:
+        for k in TOKEN_KEYS:
+            tokens_by_model[call["model"]][k] += call[k]
+    contexts = sorted(c["context"] for c in main_calls)
 
     return {
         "id": path.stem,
         "project": cwd or path.parent.name,
         "start": first_ts.isoformat(),
         "date": first_ts.date().isoformat(),
-        "wall_min": round((last_ts - first_ts).total_seconds() / 60, 1),
+        "wall_min": round((win_ts[-1] - win_ts[0]).total_seconds() / 60, 1)
+        if win_ts else 0.0,
         "active_min": round(active_min, 1),
         "prompts": prompts,
         "first_prompt": first_prompt or "",
@@ -253,32 +424,280 @@ def parse_session(path, frm, to, seen_msgs, seen_prompts):
         "plan_mode": any(t in PLAN_TOOLS for t in tools),
         "tokens_by_model": {m: dict(t) for m, t in tokens_by_model.items()},
         "git_branch": git_branch,
-        "cc_version": version,
+        "cc_versions": sorted(versions),
         "permission_mode": permission_mode,
         "sandbox_disables": sandbox_disables,
         "bash_cred_hits": bash_cred_hits,
+        "api_calls": len(main_calls),
+        "context_max": contexts[-1] if contexts else 0,
+        "context_median": int(statistics.median(contexts)) if contexts else 0,
+        "output_tokens": sum(c["output"] for c in main_calls),
+        "cache_read": sum(c["cache_read"] for c in main_calls),
+        "subagent_output_tokens": 0,            # filled in by collect_sessions
+        "long_context_prompts": sum(1 for p in pstats if is_long_context(p)),
+        "days_spanned": (win_ts[-1].date() - win_ts[0].date()).days + 1 if win_ts else 0,
+        "resumed_cold": sum(1 for p in pstats if is_cold_resume(p)),
+        # working sets for the aggregates in main(); never written out
+        "_calls": main_calls, "_prompt_stats": pstats, "_typed": typed,
+        "_slash": slash, "_side_calls": side,
     }
 
 
-def collect_sessions(frm, to):
-    rows = []
-    proj_root = CLAUDE_HOME / "projects"
-    if not proj_root.is_dir():
-        return rows
-    cutoff = (frm - timedelta(days=1)).timestamp()
-    seen_msgs, seen_prompts = set(), set()
-    # oldest first so a resume's duplicated records attribute to the original
-    for path in sorted(proj_root.glob("*/*.jsonl"),
-                       key=lambda p: p.stat().st_mtime if p.exists() else 0):
+def parse_subagent(path, frm, to, seen_msgs):
+    """In-window API calls of one subagent transcript. Its 'user' turns are written
+    by the parent agent, not typed by the person, so only usage is read."""
+    calls = {}
+    for rec in read_jsonl(path):
+        msg = rec.get("message")
+        if rec.get("type") != "assistant" or not isinstance(msg, dict):
+            continue
+        ldt = local(parse_iso(rec["timestamp"])) if rec.get("timestamp") else None
+        take_call(calls, rec, msg, ldt, ldt is not None and frm <= ldt < to)
+    return [c for c in keep_unseen(calls, seen_msgs).values() if c["inwin"]]
+
+
+def recent_files(root, pattern, cutoff):
+    """Files under root matching pattern, modified since cutoff, oldest first."""
+    found = []
+    for path in root.glob(pattern):
         try:
-            if path.stat().st_mtime < cutoff:
-                continue
+            mtime = path.stat().st_mtime
         except OSError:
             continue
+        if mtime >= cutoff:
+            found.append((mtime, str(path), path))
+    return [p for _, _, p in sorted(found)]
+
+
+def collect_sessions(frm, to):
+    """(main-thread session rows, in-window subagent API calls)."""
+    rows, sub_calls = [], []
+    proj_root = CLAUDE_HOME / "projects"
+    if not proj_root.is_dir():
+        return rows, sub_calls
+    cutoff = (frm - timedelta(days=1)).timestamp()
+    seen_msgs, seen_prompts = set(), set()
+    # oldest first so a resume's duplicated records attribute to the original;
+    # main threads before subagents so a fork's copied parent turns stay main-thread
+    for path in recent_files(proj_root, "*/*.jsonl", cutoff):
         row = parse_session(path, frm, to, seen_msgs, seen_prompts)
         if row:
             rows.append(row)
-    return rows
+            sub_calls += [dict(c, session=row["id"]) for c in row.pop("_side_calls")]
+    # <project>/<session>/subagents/*.jsonl and .../subagents/workflows/<wf>/*.jsonl,
+    # attributed to the parent session (the directory name)
+    for path in recent_files(proj_root, "*/*/subagents/**/*.jsonl", cutoff):
+        sid = path.relative_to(proj_root).parts[1]
+        sub_calls += [dict(c, session=sid)
+                      for c in parse_subagent(path, frm, to, seen_msgs)]
+    sub_out = Counter()
+    for c in sub_calls:
+        sub_out[c["session"]] += c["output"]
+    for row in rows:
+        row["subagent_output_tokens"] = sub_out.get(row["id"], 0)
+    return rows, sub_calls
+
+
+# ------------------------------------------------------------ tokens and context
+
+def token_block(calls):
+    totals = dict.fromkeys(TOKEN_KEYS, 0)
+    by_model = defaultdict(lambda: dict.fromkeys(TOKEN_KEYS, 0))
+    for c in calls:
+        for k in TOKEN_KEYS:
+            totals[k] += c[k]
+            by_model[c["model"]][k] += c[k]
+    return dict({"api_calls": len(calls)}, **totals), \
+        {m: by_model[m] for m in sorted(by_model)}
+
+
+def tokens_summary(main_calls, sub_calls):
+    main, by_model_main = token_block(main_calls)
+    subs, by_model_subs = token_block(sub_calls)
+    out_by_model = Counter()
+    for c in main_calls + sub_calls:
+        out_by_model[c["model"]] += c["output"]
+    out_total = sum(out_by_model.values())
+    weighted = {name: COST_WEIGHTS[k] * (main[k] + subs[k])
+                for name, k in (("context_reread", "cache_read"),
+                                ("context_write", "cache_creation"),
+                                ("output", "output"), ("fresh_input", "input"))}
+    weight_total = sum(weighted.values())
+    return {
+        "main": main,
+        "subagents": subs,
+        "by_model_main": by_model_main,
+        "by_model_subagents": by_model_subs,
+        "model_output_share_pct": {m: pct(n, out_total)
+                                   for m, n in sorted(out_by_model.items(),
+                                                      key=lambda kv: (-kv[1], kv[0]))},
+        "cost_mix_pct": {k: pct(v, weight_total) for k, v in weighted.items()},
+    }
+
+
+def context_hygiene(sessions, main_calls):
+    """Main thread only: how big the conversation was at each step and prompt."""
+    ctx = sorted(c["context"] for c in main_calls)
+    big = [v for v in ctx if v >= LONG_CONTEXT_TOKENS]
+    scored = [p for s in sessions for p in s["_prompt_stats"] if p["calls"]]
+    long_ctx = [p for p in scored if is_long_context(p)]
+    cold = [p for p in scored if is_cold_resume(p)]
+    spanning = sum(1 for s in sessions if s["days_spanned"] > 1)
+
+    def per_prompt(group):
+        n = len(group)
+        return {
+            "n": n,
+            "api_calls_per_prompt": round(sum(p["calls"] for p in group) / n, 1) if n else None,
+            "output_per_prompt": round(sum(p["output"] for p in group) / n) if n else None,
+            "context_reread_per_prompt": round(sum(p["context"] for p in group) / n)
+            if n else None,
+        }
+
+    overall = per_prompt(scored)
+    return {
+        "api_calls": len(ctx),
+        "context_per_call_tokens": {
+            "mean": round(sum(ctx) / len(ctx)) if ctx else None,
+            "median": int(statistics.median(ctx)) if ctx else None,
+            "p90": nearest_rank(ctx, 0.9),
+            "max": ctx[-1] if ctx else None,
+        },
+        "calls_over_200k_pct": pct(len(big), len(ctx)),
+        "context_tokens_in_calls_over_200k_pct": pct(sum(big), sum(ctx)),
+        "prompts_scored": len(scored),
+        "median_context_at_prompt": int(statistics.median(p["first_context"] for p in scored))
+        if scored else None,
+        "long_context_prompts": {
+            "threshold_tokens": LONG_CONTEXT_TOKENS,
+            "count": len(long_ctx),
+            "pct_of_prompts": pct(len(long_ctx), len(scored)),
+            "context_tokens_consumed": sum(p["context"] for p in long_ctx),
+            "output_tokens_consumed": sum(p["output"] for p in long_ctx),
+        },
+        "cold_resume_prompts": {
+            "gap_minutes": COLD_RESUME_GAP_MIN,
+            "min_context_tokens": COLD_RESUME_MIN_CONTEXT,
+            "count": len(cold),
+            "recache_tokens": sum(p["first_cache_creation"] for p in cold),
+        },
+        "sessions_spanning_days": {"count": spanning,
+                                   "pct_of_sessions": pct(spanning, len(sessions))},
+        "by_prompt_length": {
+            "short_lt40": per_prompt([p for p in scored
+                                      if p["chars"] < SHORT_PROMPT_CHARS]),
+            "medium_40_199": per_prompt([p for p in scored
+                                         if SHORT_PROMPT_CHARS <= p["chars"]
+                                         < BRIEF_PROMPT_CHARS]),
+            "brief_200_plus": per_prompt([p for p in scored
+                                          if p["chars"] >= BRIEF_PROMPT_CHARS]),
+        },
+        "output_per_prompt": overall["output_per_prompt"],
+        "context_reread_per_prompt": overall["context_reread_per_prompt"],
+    }
+
+
+# ---------------------------------------------------------------- rhythm
+
+def load_holidays(path):
+    """Office holidays: one YYYY-MM-DD per line, '#' comments, blank lines ok.
+    None when the file cannot be read."""
+    try:
+        lines = Path(path).read_text(encoding="utf-8-sig", errors="replace").splitlines()
+    except OSError:
+        return None
+    days = set()
+    for line in lines:
+        token = line.split("#", 1)[0].strip()
+        if not token:
+            continue
+        try:
+            days.add(date.fromisoformat(token.split()[0]))
+        except ValueError:
+            continue
+    return days
+
+
+def merged_slash_commands(hist, sessions):
+    """Slash commands from history.jsonl plus transcript <command-name> records, so
+    /clear, /compact etc. survive history truncation. A transcript record matching
+    a history entry for the same command within SLASH_MATCH_SECONDS counts once.
+    Session ids are not compared: history files /clear under the session being
+    cleared, the transcript under the new one."""
+    counts = Counter()
+    hist_times = defaultdict(list)
+    for r in hist:
+        cmd = r["text"].split()[0] if r["text"].startswith("/") and r["text"].split() else ""
+        if SLASH_NAME.match(cmd):
+            counts[cmd] += 1
+            hist_times[cmd].append(r["dt"])
+    used = set()
+    seen = set()
+    records = sorted((r for s in sessions for r in s["_slash"]),
+                     key=lambda r: (r["dt"], r["cmd"]))
+    for r in records:
+        if r["uuid"]:
+            if r["uuid"] in seen:
+                continue
+            seen.add(r["uuid"])
+        best = None
+        for i, hdt in enumerate(hist_times.get(r["cmd"], [])):
+            gap = abs((hdt - r["dt"]).total_seconds())
+            if (r["cmd"], i) not in used and gap <= SLASH_MATCH_SECONDS \
+                    and (best is None or gap < best[0]):
+                best = (gap, i)
+        if best:
+            used.add((r["cmd"], best[1]))
+        else:
+            counts[r["cmd"]] += 1
+    return counts
+
+
+def workday_calendar(frm_date, through, holidays):
+    """Mon-Fri days from frm_date to `through` (data_through, so a partial window
+    is not charged for days that have not happened yet), minus holidays."""
+    days = [frm_date + timedelta(days=i) for i in range((through - frm_date).days + 1)]
+    weekdays = [d for d in days if d.weekday() < 5]
+    holidays_in_window = [d.isoformat() for d in weekdays if d in holidays]
+    return {"workdays_mon_fri": len(weekdays),
+            "holidays_in_window": holidays_in_window,
+            "workdays_excl_holidays": len(weekdays) - len(holidays_in_window)}
+
+
+def rhythm_block(rows, holidays, workdays_excl):
+    """Prompt rhythm from rows of {dt, project}."""
+    by_day = Counter(r["dt"].date().isoformat() for r in rows)
+    by_hour = Counter(r["dt"].hour for r in rows)
+    by_weekday = Counter(r["dt"].strftime("%A") for r in rows)
+    by_project = Counter(Path(r["project"]).name for r in rows)
+    active_days = sorted(by_day)
+    counts = [by_day[d] for d in active_days]
+    p75 = statistics.quantiles(counts, n=4)[2] if len(counts) >= 4 else None
+    p25 = statistics.quantiles(counts, n=4)[0] if len(counts) >= 4 else None
+    active_workdays = sum(1 for d in map(date.fromisoformat, active_days)
+                          if d.weekday() < 5 and d not in holidays)
+    # calendar order, first max wins: deterministic on ties
+    weekday_names = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday",
+                     "Saturday", "Sunday"]
+    peak_weekday = max(weekday_names, key=lambda w: by_weekday.get(w, 0)) \
+        if by_weekday else None
+    peak_hour = max(range(24), key=lambda h: by_hour.get(h, 0)) if by_hour else None
+    return {
+        "prompts_total": len(rows),
+        "active_days": len(active_days),
+        "active_workdays": active_workdays,
+        "active_weekend_or_holiday_days": len(active_days) - active_workdays,
+        "usage_pct": pct(active_workdays, workdays_excl),
+        "prompts_by_day": dict(sorted(by_day.items())),
+        "by_hour_local": {str(h): by_hour[h] for h in sorted(by_hour)},
+        "by_weekday": dict(by_weekday),
+        "peak_weekday": peak_weekday,
+        "peak_hour_local": peak_hour,
+        "per_project": dict(by_project.most_common()),
+        "heavy_days": sum(1 for c in counts if p75 and c >= p75),
+        "light_days": sum(1 for c in counts if p25 and c <= p25),
+        "p75_threshold": p75, "p25_threshold": p25,
+    }
 
 
 # ------------------------------------------------------- insights caches (optional)
@@ -289,12 +708,11 @@ def load_cache_dir(name):
     if not d.is_dir():
         return out
     for f in d.glob("*.json"):
-        try:
-            data = json.loads(f.read_text(encoding="utf-8", errors="replace"))
-        except Exception:
+        data = read_json(f)
+        if data is None:
             continue
-        sid = data.get("session_id") or f.stem
-        out[sid] = data
+        sid = data.get("session_id")
+        out[sid if isinstance(sid, str) and sid else f.stem] = data
     return out
 
 
@@ -307,28 +725,45 @@ def count_dir(p, pattern="*"):
         return 0
 
 
-def hooks_count(settings_path):
+def skill_dirs(p):
+    """Skill folder names. Dot-folders (.trash, .claude ...) and the account-synced
+    `synced` folder are not skills."""
     try:
-        data = json.loads(Path(settings_path).read_text())
-        hooks = data.get("hooks") or {}
-        return sum(len(v) if isinstance(v, list) else 1 for v in hooks.values())
-    except Exception:
+        return sorted(c.name for c in Path(p).iterdir()
+                      if c.is_dir() and not c.name.startswith(".") and c.name != "synced")
+    except OSError:
+        return []
+
+
+def hooks_count(settings_path):
+    data = read_json(settings_path) or {}
+    hooks = data.get("hooks") or {}
+    if not isinstance(hooks, dict):
         return 0
+    return sum(len(v) if isinstance(v, list) else 1 for v in hooks.values())
 
 
 def foundation_scan(project_paths):
+    # keyed by project basename: no absolute paths in metrics.json
     per_project = {}
     for cwd in sorted(project_paths):
         p = Path(cwd)
         if not p.is_dir():
             continue
+        name, n = p.name or "?", 2
+        while name in per_project:
+            name, n = f"{p.name}~{n}", n + 1
         claude_md = p / "CLAUDE.md"
-        per_project[cwd] = {
-            "claude_md_lines": len(claude_md.read_text(errors="replace").splitlines())
-            if claude_md.is_file() else 0,
-            "claude_md_mtime": datetime.fromtimestamp(claude_md.stat().st_mtime)
-            .date().isoformat() if claude_md.is_file() else None,
-            "skills": count_dir(p / ".claude" / "skills"),
+        try:
+            md_lines = len(claude_md.read_text(encoding="utf-8", errors="replace")
+                           .splitlines())
+            md_mtime = datetime.fromtimestamp(claude_md.stat().st_mtime).date().isoformat()
+        except OSError:
+            md_lines, md_mtime = 0, None
+        per_project[name] = {
+            "claude_md_lines": md_lines,
+            "claude_md_mtime": md_mtime,
+            "skills": len(skill_dirs(p / ".claude" / "skills")),
             "commands": count_dir(p / ".claude" / "commands", "*.md"),
             "hooks": hooks_count(p / ".claude" / "settings.json"),
         }
@@ -337,7 +772,7 @@ def foundation_scan(project_paths):
         mem_files += count_dir(d, "*.md")
     return {
         "projects": per_project,
-        "global_skills": count_dir(CLAUDE_HOME / "skills"),
+        "global_skills": len(skill_dirs(CLAUDE_HOME / "skills")),
         "global_hooks": hooks_count(CLAUDE_HOME / "settings.json"),
         "plugins": count_dir(CLAUDE_HOME / "plugins" / "marketplaces"),
         "memory_files": mem_files,
@@ -346,16 +781,37 @@ def foundation_scan(project_paths):
 
 # ---------------------------------------------------------------- security posture
 
+def _host(url):
+    """Host of a URL: no scheme, path, query or user:password@ part."""
+    rest = re.sub(r"^[\w.+-]+://", "", str(url))
+    return re.split(r"[/?#]", rest, maxsplit=1)[0].rsplit("@", 1)[-1]
+
+
 def _mcp_entry(cfg):
     """Provenance only: server type plus binary/host, never args or env."""
     if not isinstance(cfg, dict):
         return "?"
     if cfg.get("url"):
-        host = re.sub(r"^\w+://", "", str(cfg["url"])).split("/")[0]
-        return f"{cfg.get('type', 'http')}:{host}"
-    cmd = str(cfg.get("command", "?")).split("/")[-1]
+        return f"{cfg.get('type', 'http')}:{_host(cfg['url'])}"
+    cmd = re.split(r"[\\/]", str(cfg.get("command", "?")))[-1]
     return f"stdio:{cmd}"
 
+
+def _marketplace_source(src):
+    """Provenance only: github:<owner/repo>, or the type plus host for URL
+    sources; never a full URL or a local path."""
+    if isinstance(src, dict):
+        kind = str(src.get("source") or "?")
+        if src.get("repo"):
+            return f"{kind}:{src['repo']}"
+        if src.get("url"):
+            return f"{kind}:{_host(src['url'])}"
+        return kind
+    if isinstance(src, str):
+        if "://" in src:
+            return f"url:{_host(src)}"
+        return "path" if src.startswith(("/", "~", ".")) or ":\\" in src else src
+    return "?"
 
 
 # Allow-rules that let the assistant do something irreversible or production-
@@ -373,7 +829,8 @@ DANGEROUS_ALLOW_PATTERNS = [
      "direct database mutation"),
     (r"npm publish|twine|cargo publish|gem push", "publishes a package"),
     (r"\bsudo\b|chmod 777|systemctl|crontab", "privileged system change"),
-    (r"prod", "mentions production"),
+    # word-bounded: "Product", "product_list" are not production
+    (r"\bprod\b|\bproduction\b|\bprd\b", "mentions production"),
 ]
 SAFE_HINTS = (r"(status|log|diff|show|fetch|--dry-run|-n\b|list|describe|\bget\b|\bls\b|"
               r"is-active|current-context|config (get|view|current)|test_|--version|--help|"
@@ -381,9 +838,11 @@ SAFE_HINTS = (r"(status|log|diff|show|fetch|--dry-run|-n\b|list|describe|\bget\b
 
 
 def _rules_from(path):
-    try:
-        perms = json.loads(Path(path).read_text()).get("permissions") or {}
-    except Exception:
+    data = read_json(path)
+    if data is None:
+        return None
+    perms = data.get("permissions") or {}
+    if not isinstance(perms, dict):
         return None
     return {
         "allow": [r for r in (perms.get("allow") or []) if isinstance(r, str)],
@@ -429,52 +888,46 @@ def permission_rules_audit(project_paths):
         "review_allow_rules": [d for d in dangerous if d["severity"] == "review"],
     }
 
+
+def _version_key(v):
+    return tuple(int(x) if x.isdigit() else -1 for x in re.split(r"[.\-+]", v))
+
+
+def _dict(v):
+    return v if isinstance(v, dict) else {}
+
+
 def security_scan(sessions, project_paths):
     modes = Counter((s.get("permission_mode") or "default") for s in sessions)
     mcp = {}
-    try:
-        top = json.loads((Path.home() / ".claude.json").read_text())
-        for name, cfg in (top.get("mcpServers") or {}).items():
-            mcp[f"global:{name}"] = _mcp_entry(cfg)
-        for proj, pcfg in (top.get("projects") or {}).items():
-            if proj in project_paths:
-                for name, cfg in (pcfg.get("mcpServers") or {}).items():
-                    mcp[f"{Path(proj).name}:{name}"] = _mcp_entry(cfg)
-    except Exception:
-        pass
+    top = read_json(Path.home() / ".claude.json") or {}
+    for name, cfg in _dict(top.get("mcpServers")).items():
+        mcp[f"global:{name}"] = _mcp_entry(cfg)
+    for proj, pcfg in _dict(top.get("projects")).items():
+        if proj in project_paths:
+            for name, cfg in _dict(_dict(pcfg).get("mcpServers")).items():
+                mcp[f"{Path(proj).name}:{name}"] = _mcp_entry(cfg)
     for cwd in project_paths:
-        f = Path(cwd) / ".mcp.json"
-        try:
-            for name, cfg in (json.loads(f.read_text()).get("mcpServers") or {}).items():
-                mcp[f"{Path(cwd).name}:{name}"] = _mcp_entry(cfg)
-        except Exception:
-            continue
+        data = read_json(Path(cwd) / ".mcp.json") or {}
+        for name, cfg in _dict(data.get("mcpServers")).items():
+            mcp[f"{Path(cwd).name}:{name}"] = _mcp_entry(cfg)
     marketplaces = {}
-    try:
-        km = json.loads((CLAUDE_HOME / "plugins" / "known_marketplaces.json").read_text())
-        for name, cfg in (km.items() if isinstance(km, dict) else []):
-            src = cfg.get("source") if isinstance(cfg, dict) else cfg
-            marketplaces[name] = src if isinstance(src, str) else json.dumps(src)
-    except Exception:
-        pass
-    skills = sorted(p.name for p in (CLAUDE_HOME / "skills").glob("*") if p.is_dir())
+    km = read_json(CLAUDE_HOME / "plugins" / "known_marketplaces.json") or {}
+    for name, cfg in km.items():
+        marketplaces[name] = _marketplace_source(
+            cfg.get("source") if isinstance(cfg, dict) else cfg)
+    skills = skill_dirs(CLAUDE_HOME / "skills")
     for cwd in project_paths:
-        skills += [f"{Path(cwd).name}:{p.name}"
-                   for p in (Path(cwd) / ".claude" / "skills").glob("*") if p.is_dir()]
-    cleanup_days = None
-    try:
-        cleanup_days = json.loads((CLAUDE_HOME / "settings.json").read_text()) \
-            .get("cleanupPeriodDays")
-    except Exception:
-        pass
+        skills += [f"{Path(cwd).name}:{n}" for n in skill_dirs(Path(cwd) / ".claude" / "skills")]
+    cleanup_days = (read_json(CLAUDE_HOME / "settings.json") or {}).get("cleanupPeriodDays")
     pretool_hooks = 0
     for cfg in [CLAUDE_HOME / "settings.json"] + \
             [Path(c) / ".claude" / "settings.json" for c in project_paths]:
-        try:
-            hooks = json.loads(cfg.read_text()).get("hooks") or {}
-            pretool_hooks += len(hooks.get("PreToolUse") or [])
-        except Exception:
-            continue
+        hooks = (read_json(cfg) or {}).get("hooks") or {}
+        if isinstance(hooks, dict) and isinstance(hooks.get("PreToolUse"), list):
+            pretool_hooks += len(hooks["PreToolUse"])
+    versions = sorted({v for s in sessions for v in s.get("cc_versions", [])},
+                      key=_version_key)
     return {
         "permission_modes_by_session": dict(modes),
         "auto_mode_sessions": modes.get("auto", 0),
@@ -484,10 +937,11 @@ def security_scan(sessions, project_paths):
         "sandbox_disabled_bash_calls": sum(s.get("sandbox_disables", 0) for s in sessions),
         "bash_commands_with_credential_shapes": sum(s.get("bash_cred_hits", 0)
                                                     for s in sessions),
-        "cc_versions_in_window": sorted({s["cc_version"] for s in sessions
-                                         if s.get("cc_version")}),
+        "cc_versions_in_window": versions,
         "mcp_servers": mcp,
         "marketplaces": marketplaces,
+        "marketplaces_outside_approved": sorted(n for n in marketplaces
+                                                if n not in APPROVED_MARKETPLACES),
         "skills_installed": sorted(set(skills)),
         "cleanup_period_days": cleanup_days,
         "data_retention_attestation": None,
@@ -496,17 +950,54 @@ def security_scan(sessions, project_paths):
     }
 
 
+def security_flags(sec, prompt_cred_hits, workdays):
+    """Deterministic checklist: one flag per check that needs tidying."""
+    rules = sec["permission_rules"]
+    try:
+        cleanup = int(sec["cleanup_period_days"])
+    except (TypeError, ValueError):
+        cleanup = None
+    checks = [
+        ("bypass_permissions_sessions", sec["bypass_permissions_sessions"] > 0),
+        ("bypass_permissions_default_mode",
+         "bypassPermissions" in rules["default_modes"].values()),
+        ("dangerous_allow_rules", bool(rules["dangerous_allow_rules"])),
+        ("no_deny_rules_or_guard_hooks",
+         not rules["deny_rules"] and not sec["pretooluse_guard_hooks"]),
+        ("sandbox_disabled_bash_calls", sec["sandbox_disabled_bash_calls"] > 0),
+        ("credential_shapes_in_prompts", prompt_cred_hits > 0),
+        ("credential_shapes_in_bash", sec["bash_commands_with_credential_shapes"] > 0),
+        ("marketplaces_outside_approved", bool(sec["marketplaces_outside_approved"])),
+        ("single_cc_version", len(sec["cc_versions_in_window"]) == 1
+         and workdays >= SINGLE_VERSION_MIN_WORKDAYS),
+        ("cleanup_period_days", cleanup is None or cleanup < CLEANUP_MIN_DAYS),
+    ]
+    return [name for name, hit in checks if hit]
+
+
 # ---------------------------------------------------------------- main
 
 def member_name():
+    """(name, source): CCUR_MEMBER, else member.txt, else git user.name, else $USER."""
+    env = (os.environ.get("CCUR_MEMBER") or "").strip()
+    if env:
+        return env, "CCUR_MEMBER"
+    try:
+        for line in MEMBER_FILE.read_text(encoding="utf-8-sig",
+                                          errors="replace").splitlines():
+            if line.strip():
+                return line.strip(), "member.txt"
+    except OSError:
+        pass
     try:
         out = subprocess.run(["git", "config", "--global", "user.name"],
                              capture_output=True, text=True, timeout=5)
         if out.returncode == 0 and out.stdout.strip():
-            return out.stdout.strip()
+            return out.stdout.strip(), "git"
     except Exception:
         pass
-    return os.environ.get("USER") or "unknown"
+    user = os.environ.get("USER") or os.environ.get("USERNAME")  # USERNAME: Windows
+    return (user, "USER") if user else ("unknown", "unknown")
 
 
 def substantive(txt):
@@ -522,44 +1013,240 @@ def stratified_sample(prompts, cap):
     return [prompts[int(i * step)] for i in range(cap)]
 
 
+def definitions():
+    return {
+        "window": "a record counts when its own timestamp (local time) is inside the "
+                  "window; a session overlapping the window gets a row, but only its "
+                  "in-window prompts, API calls, tokens, tool calls, errors, "
+                  "interruptions and active time count",
+        "trend_break_0_2_0": "collector 0.2.0 vs 0.1.0: prompt/token/tool counts are "
+                             "limited to the window by record timestamp (0.1.0 counted "
+                             "whole sessions); subagent tokens are counted, separately "
+                             "(0.1.0 ignored them); context metrics are new; usage_pct "
+                             "excludes holidays",
+        "active_day": "calendar day (local time) with >=1 prompt in the rhythm source",
+        "usage_pct": "active Mon-Fri non-holiday days / workdays_excl_holidays; active "
+                     "weekend and holiday days are reported separately as "
+                     "active_weekend_or_holiday_days",
+        "holidays": "office holidays from holidays.txt in the plugin root (or "
+                    "--holidays); maintained by HR / the plugin owner and delivered by "
+                    "plugin update; holidays_in_window lists the Mon-Fri ones",
+        "partial": "true when the collector ran on or before the window's last day; "
+                   "data_through is then today and workday counts stop there",
+        "heavy_day": "prompts >= P75 of active days (needs >=4 active days)",
+        "light_day": "prompts <= P25 of active days",
+        "active_min": "assistant-active time: gaps <=30min between in-window transcript "
+                      "events; includes unattended/overnight runs, so it is NOT person-hours",
+        "rhythm_source": f"history.jsonl, unless it holds fewer than "
+                         f"{HISTORY_MIN_COVERAGE_PCT}% as many in-window prompts as the "
+                         f"transcripts' typed prompts (empty or truncated history): then "
+                         f"transcripts. History counts slash commands as prompts, "
+                         f"transcripts do not",
+        "typed_prompt": "main-thread transcript user record with text, not an "
+                        "interruption marker, not isMeta, not a record Claude Code wrote "
+                        "itself (slash-command echo, caveat, system-reminder, "
+                        "task-notification, `!` shell input/output); deduplicated by "
+                        "record uuid",
+        "slash_commands": f"history.jsonl entries plus transcript <command-name> "
+                          f"records; a transcript record within {SLASH_MATCH_SECONDS}s "
+                          f"of a history entry for the same command counts once",
+        "tokens": "per API call = one assistant message id with usage, deduplicated "
+                  "across all transcript files (last usage snapshot wins), attributed to "
+                  "its model and to the timestamp of its first record; estimates, not "
+                  "billing data",
+        "subagent_tokens": "API calls in projects/<project>/<session>/subagents/**/*.jsonl "
+                           "(and isSidechain records of the older inline layout), "
+                           "attributed to the parent session and counted separately "
+                           "from main-thread tokens; context_hygiene is main thread only",
+        "context_per_call": "input + cache_read + cache_creation tokens of one API call: "
+                            "the whole conversation, re-sent for that step",
+        "cost_mix_pct": "token mix weighted by price relative to the model's base input "
+                        "price: cache_read x0.1 (context_reread), cache_creation x2.0 "
+                        "(context_write, 1-hour cache TTL on subscriptions), input x1.0 "
+                        "(fresh_input), output x5.0; main + subagents; a mix, not money; "
+                        "Opus 5.5 / Fable 5.1 cache-read discounts ignored",
+        "prompts_scored": "in-window typed prompts with at least one main-thread API "
+                          "call after them in the same session; the per-prompt figures "
+                          "below are over these",
+        "context_at_prompt": "context of the first API call after a typed prompt",
+        "long_context_prompt": f"typed prompt whose first following API call had context "
+                               f">= {LONG_CONTEXT_TOKENS:,} tokens (the conversation was "
+                               f"already that big when the person pressed enter)",
+        "cold_resume": f"typed prompt sent >= {COLD_RESUME_GAP_MIN} minutes after the "
+                       f"previous main-thread API call in the same session into a "
+                       f"conversation already >= {COLD_RESUME_MIN_CONTEXT:,} tokens; "
+                       f"recache_tokens sums cache_creation of the first call after each "
+                       f"(the cache has expired, so the whole conversation is "
+                       f"re-processed). Local commands, hooks and queue records do not "
+                       f"refresh the cache, so they do not shorten the gap",
+        "tokens_per_prompt": "sum over the API calls from a typed prompt up to the next "
+                             "typed prompt in the same session: output tokens, and "
+                             "context (input + cache_read + cache_creation) as "
+                             "context_reread",
+        "prompt_length_buckets": f"character length of the typed text: short_lt40 < "
+                                 f"{SHORT_PROMPT_CHARS}, medium_40_199 "
+                                 f"{SHORT_PROMPT_CHARS}-{BRIEF_PROMPT_CHARS - 1}, "
+                                 f"brief_200_plus >= {BRIEF_PROMPT_CHARS} (the brief "
+                                 f"threshold)",
+        "days_spanned": "calendar days from a session's first to last in-window record",
+        "member": "CCUR_MEMBER env var, else ~/.claude/usage-reports/member.txt (first "
+                  "non-empty line), else git config --global user.name, else $USER; "
+                  "member_source says which",
+        "security_flags": f"+1 each: any bypassPermissions session; a bypassPermissions "
+                          f"default mode; any high-severity allow-rule; no deny rules "
+                          f"and no PreToolUse guard hooks; sandbox-disabled Bash calls; "
+                          f"credential shapes in sampled prompts; credential shapes in "
+                          f"Bash commands; a marketplace outside "
+                          f"{', '.join(APPROVED_MARKETPLACES)}; exactly one Claude Code "
+                          f"version across {SINGLE_VERSION_MIN_WORKDAYS}+ workdays; "
+                          f"cleanupPeriodDays unset or < {CLEANUP_MIN_DAYS}",
+    }
+
+
+def shared_doc(m):
+    """The fixed-schema shared document (schema 2.0). Numbers and labels only: no
+    prompt text, no paths (project basenames at most), no rule text, no URLs.
+    The skill fills only the `llm` fields and the retention attestation."""
+    rh, ss, ins, fo, sec = (m["rhythm"], m["sessions"], m["insights_cache"],
+                            m["foundation"], m["security"])
+    projects = fo["projects"].values()
+    rules = sec["permission_rules"]
+    return {
+        "schema_version": SHARED_SCHEMA_VERSION,
+        "collector_version": m["collector_version"],
+        "generated_at": m["generated_at"],
+        "member": m["member"],
+        "member_source": m["member_source"],
+        "window": dict(m["window"]),
+        "headline": {
+            "usage_pct": rh["usage_pct"],
+            "active_workdays": rh["active_workdays"],
+            "inactive_workdays": m["window"]["workdays_excl_holidays"]
+            - rh["active_workdays"],
+            "active_weekend_or_holiday_days": rh["active_weekend_or_holiday_days"],
+            "active_days_total": rh["active_days"],
+            "sessions": ss["count"],
+            "prompts_total": rh["prompts_total"],
+            "prompts_in_sessions": ss["prompts_in_sessions"],
+            "avg_active_minutes_per_active_day":
+                round(ss["active_minutes_total"] / rh["active_days"], 1)
+                if rh["active_days"] else None,
+            "peak_weekday": rh["peak_weekday"],
+            "peak_hour_local": rh["peak_hour_local"],
+            "heavy_days": rh["heavy_days"],
+            "light_days": rh["light_days"],
+            "distinct_projects": ss["distinct_projects"],
+            "rhythm_source": rh["source"],
+            "history_coverage_pct": rh["history_coverage_pct"],
+        },
+        "tokens": m["tokens"],
+        "context_hygiene": m["context_hygiene"],
+        "working_style": {
+            "interruptions_per_100_prompts": pct(ss["interruptions"],
+                                                 ss["prompts_in_sessions"]),
+            "tool_error_share_pct": pct(ss["tool_errors"], ss["tool_calls_total"]),
+            "tool_calls_total": ss["tool_calls_total"],
+            "plan_mode_session_pct": pct(ss["plan_mode_sessions"], ss["count"]),
+            "delegation_session_pct": pct(ss["delegation_sessions"], ss["count"]),
+            "slash_commands_top": dict(Counter(rh["slash_commands"]).most_common(10)),
+            "median_response_time_s": ins["median_response_time_s"],
+        },
+        "insights": {
+            "facet_coverage_pct": pct(ins["facet_sessions"], ss["count"]),
+            "outcomes": ins["outcomes"],
+            "frictions_top": dict(Counter(ins["frictions"]).most_common(10)),
+            "git_commits": ins["git_commits"],
+            "git_pushes": ins["git_pushes"],
+        },
+        "foundation": {
+            "projects_total": len(projects),
+            "projects_with_claude_md": sum(1 for p in projects if p["claude_md_lines"]),
+            "claude_md_lines_max": max((p["claude_md_lines"] for p in projects), default=0),
+            "project_skills": sum(p["skills"] for p in projects),
+            "project_commands": sum(p["commands"] for p in projects),
+            "project_hooks": sum(p["hooks"] for p in projects),
+            "global_skills": fo["global_skills"],
+            "global_hooks": fo["global_hooks"],
+            "plugins": fo["plugins"],
+            "memory_files": fo["memory_files"],
+        },
+        "security": {
+            "flags_total": sec["flags_total"],
+            "flags": sec["flags"],
+            "bypass_permissions_sessions": sec["bypass_permissions_sessions"],
+            "auto_mode_sessions": sec["auto_mode_sessions"],
+            "default_modes": rules["default_modes"],
+            "dangerous_allow_rules_count": len(rules["dangerous_allow_rules"]),
+            "review_allow_rules_count": len(rules["review_allow_rules"]),
+            "deny_rules_count": len(rules["deny_rules"]),
+            "pretooluse_guard_hooks": sec["pretooluse_guard_hooks"],
+            "sandbox_disabled_bash_calls": sec["sandbox_disabled_bash_calls"],
+            "credential_shapes_in_prompts":
+                m["hygiene"]["sampled_prompts_with_credential_shapes"],
+            "credential_shapes_in_bash": sec["bash_commands_with_credential_shapes"],
+            "marketplaces": sorted(sec["marketplaces"]),
+            "marketplaces_outside_approved": sec["marketplaces_outside_approved"],
+            "mcp_servers_count": len(sec["mcp_servers"]),
+            "cc_versions_count": len(sec["cc_versions_in_window"]),
+            "cc_version_newest": sec["cc_versions_in_window"][-1]
+            if sec["cc_versions_in_window"] else None,
+            "cleanup_period_days": sec["cleanup_period_days"],
+            "data_retention_attestation": None,
+        },
+        "llm": {"category_mix_pct": None, "coding_submix_pct": None,
+                "prompt_quality": None, "learning_themes": None, "deltas": None},
+    }
+
+
 def main():
-    ap = argparse.ArgumentParser(description=__doc__)
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--from", dest="frm", required=True, help="YYYY-MM-DD inclusive")
     ap.add_argument("--to", dest="to", required=True, help="YYYY-MM-DD inclusive")
     ap.add_argument("--out", required=True, help="output directory")
     ap.add_argument("--sample", type=int, default=60, help="max prompts to sample")
+    ap.add_argument("--holidays", help="holiday file to use instead of the plugin's "
+                                       "holidays.txt (YYYY-MM-DD per line)")
     args = ap.parse_args()
 
-    frm = datetime.fromisoformat(args.frm).astimezone()
-    to = datetime.fromisoformat(args.to).astimezone() + timedelta(days=1, seconds=-1)
+    frm_date, to_date = date.fromisoformat(args.frm), date.fromisoformat(args.to)
+    frm, to = local_midnight(frm_date), local_midnight(to_date + timedelta(days=1))
+    today = datetime.now().astimezone().date()
+    partial = today <= to_date
+    through = today if partial else to_date
+    holidays = load_holidays(args.holidays or HOLIDAYS_FILE)
+    if holidays is None:
+        if args.holidays:
+            print(f"warning: cannot read --holidays {args.holidays}; no holidays applied",
+                  file=sys.stderr)
+        holidays = set()
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
 
     hist = collect_history(frm, to)
-    sessions = collect_sessions(frm, to)
+    sessions, sub_calls = collect_sessions(frm, to)
     facets = load_cache_dir("facets")
     session_meta = load_cache_dir("session-meta")
+    member, member_source = member_name()
 
-    # rhythm from history.jsonl
-    by_day = Counter(r["dt"].date().isoformat() for r in hist)
-    by_hour = Counter(r["dt"].hour for r in hist)
-    by_weekday = Counter(r["dt"].strftime("%A") for r in hist)
-    by_project = Counter(Path(r["project"]).name for r in hist)
-    slash = Counter(r["text"].split()[0] for r in hist
-                    if r["text"].startswith("/") and r["text"].split())
-    active_days = sorted(by_day)
-    counts = [by_day[d] for d in active_days]
-    p75 = statistics.quantiles(counts, n=4)[2] if len(counts) >= 4 else None
-    p25 = statistics.quantiles(counts, n=4)[0] if len(counts) >= 4 else None
-    workdays = sum(1 for i in range((to.date() - frm.date()).days + 1)
-                   if (frm.date() + timedelta(days=i)).weekday() < 5)
-    active_workdays = sum(1 for d in active_days
-                          if datetime.fromisoformat(d).weekday() < 5)
-    active_weekend_days = len(active_days) - active_workdays
+    # rhythm: history.jsonl unless it is missing a big share of the typed prompts
+    calendar = workday_calendar(frm_date, through, holidays)
+    typed = [p for s in sessions for p in s["_typed"]]
+    coverage = pct(len(hist), len(typed))
+    source = "transcripts" if typed and len(hist) * 100 < \
+        HISTORY_MIN_COVERAGE_PCT * len(typed) else "history"
+    rhythm = rhythm_block(hist if source == "history" else typed,
+                          holidays, calendar["workdays_excl_holidays"])
+    rhythm.update({
+        "source": source,
+        "prompts_history": len(hist),
+        "prompts_transcripts": len(typed),
+        "history_coverage_pct": coverage,
+        "slash_commands": dict(merged_slash_commands(hist, sessions).most_common(20)),
+    })
 
     # session aggregates + cache joins
     tools_total = Counter()
-    model_tokens = defaultdict(lambda: Counter())
     outcomes, categories, frictions, satisfaction, helpfulness = (
         Counter(), Counter(), Counter(), Counter(), Counter())
     git_commits = git_pushes = meta_interruptions = 0
@@ -567,61 +1254,42 @@ def main():
     facet_hits = meta_hits = 0
     for s in sessions:
         tools_total.update(s["tools"])
-        for model, toks in s["tokens_by_model"].items():
-            for k, v in toks.items():
-                model_tokens[model][k] += v
         f = facets.get(s["id"])
         if f:
             facet_hits += 1
             s["facet"] = {k: f.get(k) for k in
                           ("goal_categories", "outcome", "friction_counts",
                            "session_type", "primary_success", "brief_summary")}
-            outcomes[f.get("outcome") or "?"] += 1
-            for c, n in (f.get("goal_categories") or {}).items():
-                categories[c] += n
-            for c, n in (f.get("friction_counts") or {}).items():
-                frictions[c] += n
-            for c, n in (f.get("user_satisfaction_counts") or {}).items():
-                satisfaction[c] += n
-            helpfulness[f.get("claude_helpfulness") or "?"] += 1
+            outcomes[str(f.get("outcome") or "?")] += 1
+            for c, n in _dict(f.get("goal_categories")).items():
+                categories[c] += tok(n)
+            for c, n in _dict(f.get("friction_counts")).items():
+                frictions[c] += tok(n)
+            for c, n in _dict(f.get("user_satisfaction_counts")).items():
+                satisfaction[c] += tok(n)
+            helpfulness[str(f.get("claude_helpfulness") or "?")] += 1
         m = session_meta.get(s["id"])
         if m:
             meta_hits += 1
-            git_commits += m.get("git_commits") or 0
-            git_pushes += m.get("git_pushes") or 0
-            meta_interruptions += m.get("user_interruptions") or 0
-            rts = m.get("user_response_times") or []
+            git_commits += tok(m.get("git_commits"))
+            git_pushes += tok(m.get("git_pushes"))
+            meta_interruptions += tok(m.get("user_interruptions"))
+            rts = [v for v in (m.get("user_response_times") or [])
+                   if isinstance(v, (int, float))]
             if rts:
                 response_time_medians.append(statistics.median(rts))
 
+    main_calls = [c for s in sessions for c in s["_calls"]]
+    project_paths = {s["project"] for s in sessions}
     metrics = {
         "generated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
-        "member": member_name(),
-        "window": {"from": args.frm, "to": args.to, "workdays_mon_fri": workdays},
-        "collector_version": "0.1.0",
-        "definitions": {
-            "active_day": "calendar day (local time) with >=1 typed prompt (history.jsonl)",
-            "usage_pct": "active Mon-Fri days / Mon-Fri workdays in window; weekend days reported separately",
-            "heavy_day": "prompts >= P75 of active days (needs >=4 active days)",
-            "light_day": "prompts <= P25 of active days",
-            "active_min": "assistant-active time: gaps <=30min between transcript events; includes unattended/overnight runs, so it is NOT person-hours",
-            "tokens": "deduplicated per API message id, attributed to that message's model; estimates, not billing data",
-        },
-        "rhythm": {
-            "prompts_total": len(hist),
-            "active_days": len(active_days),
-            "active_workdays": active_workdays,
-            "active_weekend_days": active_weekend_days,
-            "usage_pct": round(100 * active_workdays / workdays, 1) if workdays else None,
-            "prompts_by_day": dict(sorted(by_day.items())),
-            "by_hour_local": {str(h): by_hour[h] for h in sorted(by_hour)},
-            "by_weekday": dict(by_weekday),
-            "per_project": dict(by_project.most_common()),
-            "heavy_days": sum(1 for c in counts if p75 and c >= p75),
-            "light_days": sum(1 for c in counts if p25 and c <= p25),
-            "p75_threshold": p75, "p25_threshold": p25,
-            "slash_commands": dict(slash.most_common(20)),
-        },
+        "member": member,
+        "member_source": member_source,
+        "window": dict({"from": args.frm, "to": args.to, "partial": partial,
+                        "data_through": through.isoformat()}, **calendar),
+        "collector_version": COLLECTOR_VERSION,
+        "definitions": definitions(),
+        "rhythm": rhythm,
         "sessions": {
             "count": len(sessions),
             "active_minutes_total": round(sum(s["active_min"] for s in sessions), 1),
@@ -633,13 +1301,15 @@ def main():
             "tools_top": dict(tools_total.most_common(15)),
             "plan_mode_sessions": sum(1 for s in sessions if s["plan_mode"]),
             "delegation_sessions": sum(1 for s in sessions if s["delegation_calls"]),
-            "distinct_projects": len({s["project"] for s in sessions}),
-            "model_tokens": {m: dict(c) for m, c in model_tokens.items()},
+            "distinct_projects": len(project_paths),
         },
+        "tokens": tokens_summary(main_calls, sub_calls),
+        "context_hygiene": context_hygiene(sessions, main_calls),
         "insights_cache": {
             "facet_coverage": f"{facet_hits}/{len(sessions)}",
+            "facet_sessions": facet_hits,
             "meta_coverage": f"{meta_hits}/{len(sessions)}",
-            "outcomes": dict(outcomes),
+            "outcomes": dict(outcomes.most_common()),
             "goal_categories": dict(categories.most_common()),
             "frictions": dict(frictions.most_common()),
             "satisfaction": dict(satisfaction),
@@ -650,32 +1320,42 @@ def main():
             "median_response_time_s": round(statistics.median(response_time_medians), 1)
             if response_time_medians else None,
         },
-        "foundation": foundation_scan({s["project"] for s in sessions}),
-        "security": security_scan(sessions, {s["project"] for s in sessions}),
+        "foundation": foundation_scan(project_paths),
+        "security": security_scan(sessions, project_paths),
     }
 
-    with open(out / "sessions.jsonl", "w") as fh:
+    with open(out / "sessions.jsonl", "w", encoding="utf-8") as fh:
         fh.write(json.dumps({"_notice": "LOCAL ONLY. Contains work content. Never share."}) + "\n")
         for s in sorted(sessions, key=lambda r: r["start"]):
             slim = {k: s[k] for k in ("id", "project", "date", "active_min", "prompts",
-                                      "first_prompt", "tool_errors", "interruptions")}
+                                      "first_prompt", "tool_errors", "interruptions",
+                                      "api_calls", "context_max", "context_median",
+                                      "output_tokens", "cache_read",
+                                      "subagent_output_tokens", "long_context_prompts",
+                                      "days_spanned", "resumed_cold")}
             slim["top_tools"] = Counter(s["tools"]).most_common(5)
             slim["facet"] = s.get("facet")
             fh.write(json.dumps(slim) + "\n")
 
-    pool = [r for r in hist if substantive(r["text"])]
+    # sample from the rhythm source; transcript text that opens with a tag is a
+    # system echo (<task-notification>, <bash-input> ...), not a brief
+    if source == "history":
+        pool = [r for r in hist if substantive(r["text"])]
+    else:
+        pool = [r for r in typed if substantive(r["text"].strip())
+                and not r["text"].lstrip().startswith("<")]
     sample = stratified_sample(pool, args.sample)
     secret_pastes = 0
-    with open(out / "prompt_sample.jsonl", "w") as fh:
+    with open(out / "prompt_sample.jsonl", "w", encoding="utf-8") as fh:
         fh.write(json.dumps({"_notice": "LOCAL ONLY. Contains work content "
                              "(credential-shaped strings auto-masked, best effort). Never share."}) + "\n")
         for r in sample:
-            text, hits = redact(r["text"][:SAMPLE_PROMPT_CHARS])
+            text, hits = redact(r["text"].strip()[:SAMPLE_PROMPT_CHARS])
             secret_pastes += 1 if hits else 0
             fh.write(json.dumps({
                 "ts": r["dt"].isoformat(timespec="minutes"),
                 "project": Path(r["project"]).name,
-                "brief": len(r["text"]) >= 200,
+                "brief": len(r["text"].strip()) >= BRIEF_PROMPT_CHARS,
                 "text": text,
             }) + "\n")
     metrics["hygiene"] = {
@@ -683,10 +1363,23 @@ def main():
         "note": "count of sampled prompts where masking fired; if > 0 the report "
                 "suggests env vars / files as the easier alternative",
     }
-    (out / "metrics.json").write_text(json.dumps(metrics, indent=1))
+    sec = metrics["security"]
+    sec["flags"] = security_flags(sec, secret_pastes, calendar["workdays_mon_fri"])
+    sec["flags_total"] = len(sec["flags"])
 
-    print(f"ccur-collect: {len(hist)} prompts / {len(active_days)} active days / "
-          f"{len(sessions)} sessions ({facet_hits} with facets) -> {out}")
+    (out / "metrics.json").write_text(json.dumps(metrics, indent=1), encoding="utf-8")
+    (out / "shared.json").write_text(json.dumps(shared_doc(metrics), indent=1),
+                                     encoding="utf-8")
+
+    ch = metrics["context_hygiene"]
+    median_ctx = ch["context_per_call_tokens"]["median"]
+    print(f"ccur-collect: {rhythm['prompts_total']} prompts / {rhythm['active_days']} "
+          f"active days / {len(sessions)} sessions ({facet_hits} with facets) -> {out}")
+    print(f"context: median {round((median_ctx or 0) / 1000)}k per call | "
+          f"{ch['long_context_prompts']['count']} long-context prompts "
+          f"({ch['long_context_prompts']['pct_of_prompts'] or 0}%) | "
+          f"{ch['cold_resume_prompts']['count']} cold resumes | subagent output "
+          f"{human_tokens(metrics['tokens']['subagents']['output'])}")
     print(f"sampled {len(sample)} of {len(pool)} substantive prompts for scoring")
 
 
